@@ -73,6 +73,243 @@ idx_tup_read
 FROM pg_stat_user_indexes
 ORDER BY 4 DESC,1,2,3;
                                       
+Get name and value from pg_settings
+select name,setting from pg_settings;
+Never-Used Indexes
+WITH table_scans as (
+    SELECT relid,
+        tables.idx_scan + tables.seq_scan as all_scans,
+        ( tables.n_tup_ins + tables.n_tup_upd + tables.n_tup_del ) as writes,
+                pg_relation_size(relid) as table_size
+        FROM pg_stat_user_tables as tables
+),
+all_writes as (
+    SELECT sum(writes) as total_writes
+    FROM table_scans
+),
+indexes as (
+    SELECT idx_stat.relid, idx_stat.indexrelid,
+        idx_stat.schemaname, idx_stat.relname as tablename,
+        idx_stat.indexrelname as indexname,
+        idx_stat.idx_scan,
+        pg_relation_size(idx_stat.indexrelid) as index_bytes,
+        indexdef ~* 'USING btree' AS idx_is_btree
+    FROM pg_stat_user_indexes as idx_stat
+        JOIN pg_index
+            USING (indexrelid)
+        JOIN pg_indexes as indexes
+            ON idx_stat.schemaname = indexes.schemaname
+                AND idx_stat.relname = indexes.tablename
+                AND idx_stat.indexrelname = indexes.indexname
+    WHERE pg_index.indisunique = FALSE
+),
+index_ratios AS (
+SELECT schemaname, tablename, indexname,
+    idx_scan, all_scans,
+    round(( CASE WHEN all_scans = 0 THEN 0.0::NUMERIC
+        ELSE idx_scan::NUMERIC/all_scans * 100 END),2) as index_scan_pct,
+    writes,
+    round((CASE WHEN writes = 0 THEN idx_scan::NUMERIC ELSE idx_scan::NUMERIC/writes END),2)
+        as scans_per_write,
+    pg_size_pretty(index_bytes) as index_size,
+    pg_size_pretty(table_size) as table_size,
+    idx_is_btree, index_bytes
+    FROM indexes
+    JOIN table_scans
+    USING (relid)
+),
+index_groups AS (
+SELECT 'Never Used Indexes' as reason, *, 1 as grp
+FROM index_ratios
+WHERE
+    idx_scan = 0
+    and idx_is_btree
+UNION ALL
+SELECT 'Low Scans, High Writes' as reason, *, 2 as grp
+FROM index_ratios
+WHERE
+    scans_per_write <= 1
+    and index_scan_pct < 10
+    and idx_scan > 0
+    and writes > 100
+    and idx_is_btree
+UNION ALL
+SELECT 'Seldom Used Large Indexes' as reason, *, 3 as grp
+FROM index_ratios
+WHERE
+    index_scan_pct < 5
+    and scans_per_write > 1
+    and idx_scan > 0
+    and idx_is_btree
+    and index_bytes > 100000000
+UNION ALL
+SELECT 'High-Write Large Non-Btree' as reason, index_ratios.*, 4 as grp
+FROM index_ratios, all_writes
+WHERE
+    ( writes::NUMERIC / ( total_writes + 1 ) ) > 0.02
+    AND NOT idx_is_btree
+    AND index_bytes > 100000000
+ORDER BY grp, index_bytes DESC )
+SELECT reason, schemaname, tablename, indexname,
+    index_scan_pct, scans_per_write, index_size, table_size
+FROM index_groups;
+Age of DB and Tables
+SELECT datname, age(datfrozenxid) FROM pg_database;
+SELECT c.oid::regclass as table_name,
+       greatest(age(c.relfrozenxid),age(t.relfrozenxid)) as age
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind IN ('r', 'm');
+                                        
+Grant Privileges on All Tables
+SELECT 'grant select,update,usage on '||c.relname||' to username;' FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r',") AND n.nspname='schemaname' AND pg_catalog.pg_get_userbyid(c.relowner)='username';
+Check Privileges on Tables
+SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'S' THEN 'sequence' END as "Type",
+  pg_catalog.array_to_string(c.relacl, E'\n') AS "Access privileges",
+  pg_catalog.array_to_string(ARRAY(
+    SELECT attname || E':\n  ' || pg_catalog.array_to_string(attacl, E'\n  ')
+    FROM pg_catalog.pg_attribute a
+    WHERE attrelid = c.oid AND NOT attisdropped AND attacl IS NOT NULL
+  ), E'\n') AS "Column access privileges"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r') AND pg_catalog.pg_get_userbyid(c.relowner)='username' AND n.nspname='schemaname';
+Find All Functions with Arguments
+SELECT n.nspname || '.' || p.proname || '(' || pg_catalog.oidvectortypes(p.proargtypes) || ')' as FunctionName,usename as OWNER FROM pg_proc p LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace, pg_user u WHERE p.prorettype <> 'pg_catalog.cstring'::pg_catalog.regtype AND p.proargtypes[0] <> 'pg_catalog.cstring'::pg_catalog.regtype AND pg_catalog.pg_function_is_visible(p.oid) AND p.proowner=u.usesysid AND n.nspname not in ('pg_catalog','sys');
+select prona.me||'('||pg_get_function_arguments(pg_proc.oid)||')' as function_arguments,usename,nspname from pg_proc,pg_user,pg_namespace where  proowner=pg_user.usesysid and pronamespace=pg_namespace.oid and usename<>nspname and nspname !~ '^pg_catalog|^information_schema|^sys';
+Find Privileges of a User on Objects
+SELECT n.nspname as "Schema",
+    c.relname as "Name",
+    CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' END as "Type",
+    pg_catalog.array_to_string(c.relacl, E'\n') AS "Access privileges",
+    pg_catalog.array_to_string(ARRAY(
+      SELECT attname || E':\n  ' || pg_catalog.array_to_string(attacl, E'\n  ')
+      FROM pg_catalog.pg_attribute a
+      WHERE attrelid = c.oid AND NOT attisdropped AND attacl IS NOT NULL
+    ), E'\n') AS "Column access privileges"
+  FROM pg_catalog.pg_class c
+       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind IN ('r', 'v', 'S', 'f')
+    AND n.nspname !~ '^pg_' AND pg_catalog.pg_table_is_visible(c.oid) and pg_catalog.pg_get_userbyid(c.relowner)='owner'
+  ORDER BY 1, 2;
+Granting Privileges on All Procedures
+select  'grant execute on procedure "CBF"."'||proname||'"('||pg_get_function_arguments(oid)||') to cbf_ctrl_user;' from pg_proc where pronamespace='     <oid of schema>'     ;
+OBJECT LEVEL QUERIES
+This section provides the queries which you can use for getting information at object level.
+
+Get List of All Tables and Their Row Count
+SELECT
+pgClass.relname AS tableName,
+pgClass.reltuples AS rowCount
+FROM
+pg_class pgClass
+LEFT JOIN
+pg_namespace pgNamespace ON (pgNamespace.oid = pgClass.relnamespace)
+WHERE
+pgNamespace.nspname NOT IN ('pg_catalog', 'information_schema') AND
+pgClass.relkind='r';
+Check Tables in Each User Defined Schema
+SELECT n.nspname as "Schema",
+  count(c.relname) as "Name"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r',")
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname <> 'information_schema'
+      AND n.nspname !~ '^pg_toast'
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ group by n.nspname;
+Find Parameters Changes for a Table
+SELECT c.relname, pg_catalog.array_to_string(c.reloptions || array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', ')
+FROM pg_catalog.pg_class c
+ LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)
+WHERE c.relname = 'test'
+Generate a Script to Change or Rename All Table Names to lower case
+SELECT 'alter table "'||c.relname||'" rename to '||lower(c.relname)||';'
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind ='r'
+      AND n.nspname='schemaname'
+ORDER BY 1;
+Generate a Script to Change or Rename All Columns of a Table
+For Tables
+SELECT
+        'alter table "'||c.relname||'" rename "'||a.attname||'" to '||lower(a.attname)||';'
+FROM
+        pg_class c
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_type t ON a.atttypid = t.oid
+        LEFT JOIN pg_catalog.pg_constraint r ON c.oid = r.conrelid
+                AND r.conname = a.attname
+WHERE
+        c.relnamespace = (select oid from pg_namespace where nspname="schemaname")
+        AND a.attnum > 0 AND c.relkind in ('r', 'p')
+        AND c.relname = 'table_name'
+ORDER BY a.attnum
+For All Tables in a Schema
+SELECT
+        'alter      table "'||c.relname||'" rename "'||a.attname||'" to '||lower(a.attname)||';'
+FROM
+        pg_class c
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_type t ON a.atttypid = t.oid
+        LEFT JOIN pg_catalog.pg_constraint r ON c.oid = r.conrelid
+                AND r.conname = a.attname
+WHERE
+        c.relnamespace = (select oid from pg_namespace where nspname="schemaname")
+        AND a.attnum > 0
+        AND c.relkind in ('r', 'p')
+ORDER BY a.attnum
+Find Primary Keys on Tables of a Schema
+SELECT c2.relname, i.indisprimary, i.indisunique, i.indisvalid, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true),
+  pg_catalog.pg_get_constraintdef(con.oid, true), contype
+FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i
+  LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p'))
+WHERE c.relnamespace=(select oid from pg_namespace where nspname="public") AND c.oid = i.indrelid AND i.indexrelid = c2.oid
+ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname;
+Find Sequences in a Schema
+SELECT n.nspname as "Schema",
+  c.relname as "Name",
+  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 's' THEN 'special' WHEN 'f' THEN 'foreign table' END as "Type",
+  pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('S',”)
+      AND n.nspname='schemaname'
+ORDER BY 1,2;
+Find the Constraints
+SELECT r.conname
+FROM pg_catalog.pg_constraint r
+WHERE r.connamespace = (select oid from pg_namespace where nspname="public") AND r.contype = 'c'
+ORDER BY 1;
+Find ForeignKeys
+SELECT conname,
+  pg_catalog.pg_get_constraintdef(r.oid, true) as condef
+FROM pg_catalog.pg_constraint r
+WHERE r.connamespace=(select oid from pg_namespace where nspname="public") AND r.contype = 'f' ORDER BY 1;
+Find Parent for ForeignKey
+SELECT conname, conrelid::regclass, conindid::regclass,
+  pg_catalog.pg_get_constraintdef(r.oid, true) as condef
+FROM pg_catalog.pg_constraint r
+WHERE r.connamespace=(select oid from pg_namespace where nspname="public") AND r.contype = 'f' ORDER BY 1;
+Query to Find Sequence OWNED BY
+select s.relname as "Sequence", n.nspname as "schema", t.relname as "Owned by table", a.attname as "Owned by column"
+from pg_class s
+  join pg_depend d on d.objid=s.oid and d.classid='pg_class'::regclass and d.refclassid='pg_class'::regclass
+  join pg_class t on t.oid=d.refobjid
+  join pg_namespace n on n.oid=t.relnamespace
+  join pg_attribute a on a.attrelid=t.oid and a.attnum=d.refobjsubid
+where s.relkind='S'
+                                      
+Real-Time Bloated Tables
+select relname, n_live_tup, n_dead_tup, (n_dead_tup/(n_dead_tup+n_live_tup)::float)*100 as "% of bloat", last_autovacuum, 
+last_autoanalyze from pg_stat_all_tables where (n_dead_tup+n_live_tup) > 0
+and (n_dead_tup/(n_dead_tup+n_live_tup)::float)*100 > 0;
+                                      
 Tables That Are Being Updated the Most and Looking for VACUUM
 select relname, /* pg_size_pretty( pg_relation_size( relid ) ) as table_size,
                  pg_size_pretty( pg_total_relation_size( relid ) ) as table_total_size, */
