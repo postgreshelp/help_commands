@@ -1,6 +1,6 @@
 
-pgbadger pre-requisites
-------------------------
+-- pgbadger pre-requisites
+
 log_checkpoints = on
 log_connections = on
 log_disconnections = on
@@ -15,29 +15,62 @@ Log_min_duration_statement = (see below)
 
 log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
 
-To Check Version
+-- To Check Version
 select version();
 
-To Check Size of Database
+-- To Check Size of Database
 SELECT pg_size_pretty(pg_database_size('postgres')) As fulldbsize;
 
-To Get All Catalog Tables
+-- To Get All Catalog Tables
 \dt pg_catalog.*
                                        
-Top 10 WRITE Tables
+-- kill running query
+SELECT pg_cancel_backend(procpid);
+
+-- kill idle query
+SELECT pg_terminate_backend(procpid);
+
+-- vacuum command
+VACUUM (VERBOSE, ANALYZE);
+
+-- all database users
+select * from pg_stat_activity where current_query not like '<%';
+
+-- all databases and their sizes
+select * from pg_user;
+
+-- all tables and their size, with/without indexes
+select datname, pg_size_pretty(pg_database_size(datname))
+from pg_database
+order by pg_database_size(datname) desc;
+
+-- cache hit rates (should not be less than 0.99)
+SELECT sum(heap_blks_read) as heap_read, sum(heap_blks_hit)  as heap_hit, (sum(heap_blks_hit) - sum(heap_blks_read)) / sum(heap_blks_hit) as ratio
+FROM pg_statio_user_tables;
+
+-- table index usage rates (should not be less than 0.99)
+SELECT relname, 100 * idx_scan / (seq_scan + idx_scan) percent_of_times_index_used, n_live_tup rows_in_table
+FROM pg_stat_user_tables 
+ORDER BY n_live_tup DESC;
+
+-- how many indexes are in cache
+SELECT sum(idx_blks_read) as idx_read, sum(idx_blks_hit)  as idx_hit, (sum(idx_blks_hit) - sum(idx_blks_read)) / sum(idx_blks_hit) as ratio
+FROM pg_statio_user_indexes;                                    
+                                       
+-- Top 10 WRITE Tables
 select schemaname as "Schema Name", relname as "Table Name",
 n_tup_ins+n_tup_upd+n_tup_del as "no.of writes" from
 pg_stat_all_tables where schemaname not in ('snapshots','pg_catalog')
 order by n_tup_ins+n_tup_upd+n_tup_del desc limit 10;
                                        
-Top 10 READ Tables
+-- Top 10 READ Tables
 SELECT schemaname as "Schema Name", relname as "Table
 Name",seq_tup_read+idx_tup_fetch as "no. of reads" FROM
 pg_stat_all_tables WHERE (seq_tup_read + idx_tup_fetch) > 0 and
 schemaname NOT IN ('snapshots','pg_catalog') ORDER BY
 seq_tup_read+idx_tup_fetch desc limit 10;
                                        
-Largest Tables in DB
+-- Largest Tables in DB
 SELECT QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name) as
 table_name,pg_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name)) as size,
 pg_total_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name)) as total_size,
@@ -45,13 +78,13 @@ pg_size_pretty(pg_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(tabl
 pg_size_pretty(pg_total_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name))) as pretty_total_relation_size 
 FROM information_schema.tables WHERE QUOTE_IDENT(TABLE_SCHEMA) NOT IN ('snapshots') ORDER BY size DESC LIMIT 10;
                                        
-DB Size
+-- DB Size
 SELECT datname, pg_database_size(datname),
 pg_size_pretty(pg_database_size(datname))
 FROM pg_database
 ORDER BY 2 DESC;
                                 
-Table Size
+-- Table Size
 SELECT schemaname, relname, pg_total_relation_size(schemaname
 || '.' || relname ) ,
 pg_size_pretty(pg_total_relation_size(schemaname || '.' ||
@@ -59,7 +92,7 @@ relname ))
 FROM pg_stat_user_tables
 ORDER BY 3 DESC;
                                       
-Index Size
+-- Index Size
 SELECT schemaname, relname, indexrelname,
 pg_total_relation_size(schemaname || '.' || indexrelname ) ,
 pg_size_pretty(pg_total_relation_size(schemaname || '.' ||
@@ -67,7 +100,7 @@ indexrelname ))
 FROM pg_stat_user_indexes
 ORDER BY 1,2,3,4 DESC;
                               
-Index Utilization
+-- Index Utilization
 SELECT schemaname, relname, indexrelname, idx_scan, idx_tup_fetch,
 idx_tup_read
 FROM pg_stat_user_indexes
@@ -161,7 +194,7 @@ FROM pg_class c
 LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
 WHERE c.relkind IN ('r', 'm');
                                         
-Grant Privileges on All Tables
+-- Grant Privileges on All Tables
 SELECT 'grant select,update,usage on '||c.relname||' to username;' FROM pg_catalog.pg_class c
      LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r',") AND n.nspname='schemaname' AND pg_catalog.pg_get_userbyid(c.relowner)='username';
@@ -198,10 +231,8 @@ SELECT n.nspname as "Schema",
   ORDER BY 1, 2;
 Granting Privileges on All Procedures
 select  'grant execute on procedure "CBF"."'||proname||'"('||pg_get_function_arguments(oid)||') to cbf_ctrl_user;' from pg_proc where pronamespace='     <oid of schema>'     ;
-OBJECT LEVEL QUERIES
-This section provides the queries which you can use for getting information at object level.
 
-Get List of All Tables and Their Row Count
+-- Get List of All Tables and Their Row Count
 SELECT
 pgClass.relname AS tableName,
 pgClass.reltuples AS rowCount
@@ -212,7 +243,8 @@ pg_namespace pgNamespace ON (pgNamespace.oid = pgClass.relnamespace)
 WHERE
 pgNamespace.nspname NOT IN ('pg_catalog', 'information_schema') AND
 pgClass.relkind='r';
-Check Tables in Each User Defined Schema
+
+-- Check Tables in Each User Defined Schema
 SELECT n.nspname as "Schema",
   count(c.relname) as "Name"
 FROM pg_catalog.pg_class c
@@ -235,8 +267,8 @@ FROM pg_catalog.pg_class c
 WHERE c.relkind ='r'
       AND n.nspname='schemaname'
 ORDER BY 1;
-Generate a Script to Change or Rename All Columns of a Table
-For Tables
+
+-- Generate a Script to Change or Rename All Columns of a Table For Tables
 SELECT
         'alter table "'||c.relname||'" rename "'||a.attname||'" to '||lower(a.attname)||';'
 FROM
@@ -281,7 +313,9 @@ FROM pg_catalog.pg_class c
 WHERE c.relkind IN ('S',”)
       AND n.nspname='schemaname'
 ORDER BY 1,2;
-Find the Constraints
+
+-- Find the Constraints
+
 SELECT r.conname
 FROM pg_catalog.pg_constraint r
 WHERE r.connamespace = (select oid from pg_namespace where nspname="public") AND r.contype = 'c'
@@ -305,12 +339,12 @@ from pg_class s
   join pg_attribute a on a.attrelid=t.oid and a.attnum=d.refobjsubid
 where s.relkind='S'
                                       
-Real-Time Bloated Tables
+-- Real-Time Bloated Tables
 select relname, n_live_tup, n_dead_tup, (n_dead_tup/(n_dead_tup+n_live_tup)::float)*100 as "% of bloat", last_autovacuum, 
 last_autoanalyze from pg_stat_all_tables where (n_dead_tup+n_live_tup) > 0
 and (n_dead_tup/(n_dead_tup+n_live_tup)::float)*100 > 0;
                                       
-Tables That Are Being Updated the Most and Looking for VACUUM
+-- Tables That Are Being Updated the Most and Looking for VACUUM
 select relname, /* pg_size_pretty( pg_relation_size( relid ) ) as table_size,
                  pg_size_pretty( pg_total_relation_size( relid ) ) as table_total_size, */
                  n_tup_upd, n_tup_hot_upd, n_live_tup, n_dead_tup, last_vacuum::date, last_autovacuum::date, last_analyze::date, last_autoanalyze::date
