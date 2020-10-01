@@ -24,6 +24,23 @@ SELECT pg_size_pretty(pg_database_size('postgres')) As fulldbsize;
 -- To Get All Catalog Tables
 \dt pg_catalog.*
                                        
+-- long running query
+SELECT
+  pid,
+  now() - pg_stat_activity.query_start AS duration,
+  query,
+  state
+FROM pg_stat_activity
+WHERE (now() - pg_stat_activity.query_start) > interval '5 minutes';
+                                       
+-- table lock                                       
+select pid,
+       usename,
+       pg_blocking_pids(pid) as blocked_by,
+       query as blocked_query
+from pg_stat_activity
+where cardinality(pg_blocking_pids(pid)) > 0;
+                                       
 -- kill running query
 SELECT pg_cancel_backend(procpid);
 
