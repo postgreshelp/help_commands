@@ -1,4 +1,6 @@
 
+I love :pizza:
+
 -- pgbadger pre-requisites
 
 log_checkpoints = on
