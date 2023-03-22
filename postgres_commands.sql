@@ -1,4 +1,229 @@
 
+
+Database_size 
+
+SELECT pg_database.datname Database_Name , pg_size_pretty(pg_database_size(pg_database.datname)) AS Database_Size FROM pg_database;
+
+Transaction ID TXID (Wraparound)
+----------------------------------
+SELECT max(age(datfrozenxid)) oldest_xid FROM pg_database;
+
+oldest xid per database
+------------------------
+
+SELECT datname database_name ,age(datfrozenxid) oldest_xid_per_DB 
+FROM pg_database order by 2 limit 20;
+
+percent_towards_emergency_autovac & percent_towards_wraparound 
+-----------------------------------------------------------------
+
+WITH max_age AS ( SELECT 2000000000 as max_old_xid , setting AS 
+autovacuum_freeze_max_age FROM pg_catalog.pg_settings 
+WHERE name = 'autovacuum_freeze_max_age' ) , 
+per_database_stats AS ( SELECT datname , m.max_old_xid::int , 
+m.autovacuum_freeze_max_age::int , age(d.datfrozenxid) AS oldest_xid 
+FROM pg_catalog.pg_database d JOIN max_age m ON (true) WHERE d.datallowconn ) 
+SELECT max(oldest_xid) AS oldest_xid , 
+max(ROUND(100*(oldest_xid/max_old_xid::float))) AS percent_towards_wraparound
+ , max(ROUND(100*(oldest_xid/autovacuum_freeze_max_age::float))) AS percent_towards_emergency_autovac 
+ FROM per_database_stats ;
+
+
+current running autovacuum process
+-----------------------------------
+
+SELECT datname,usename,state,query,
+now() - pg_stat_activity.query_start AS duration, 
+wait_event from pg_stat_activity where query like 'autovacuum:%' order by 4;
+
+current running vacuum process
+---------------------------------
+
+SELECT datname,usename,state,query,
+now() - pg_stat_activity.query_start AS duration,
+ wait_event from pg_stat_activity where query like 'vacuum:%' order by 4;
+
+vacuum progress process:
+--------------------------
+
+SELECT p.pid, now() - a.xact_start AS duration, coalesce(wait_event_type ||'.'|| wait_event, 'f') AS waiting, 
+  CASE WHEN a.query ~ '^autovacuum.*to prevent wraparound' THEN 'wraparound' WHEN a.query ~ '^vacuum' THEN 'user' ELSE 'regular' END AS mode, 
+  p.datname AS database, p.relid::regclass AS table, p.phase, a.query ,
+  pg_size_pretty(p.heap_blks_total * current_setting('block_size')::int) AS table_size, 
+  pg_size_pretty(pg_total_relation_size(p.relid)) AS total_size, 
+  pg_size_pretty(p.heap_blks_scanned * current_setting('block_size')::int) AS scanned, 
+  pg_size_pretty(p.heap_blks_vacuumed * current_setting('block_size')::int) AS vacuumed, 
+  round(100.0 * p.heap_blks_scanned / p.heap_blks_total, 1) AS scanned_pct, 
+  round(100.0 * p.heap_blks_vacuumed / p.heap_blks_total, 1) AS vacuumed_pct, 
+  p.index_vacuum_count,
+  p.max_dead_tuples as max_dead_tuples_per_cycle,
+  s.n_dead_tup as total_num_dead_tuples ,
+  ceil(s.n_dead_tup::float/p.max_dead_tuples::float) index_cycles_required
+FROM pg_stat_progress_vacuum p JOIN pg_stat_activity a using (pid) 
+     join pg_stat_all_tables s on s.relid = p.relid
+ORDER BY now() - a.xact_start DESC;
+
+Inactive replication slots order by age_xmin
+-------------------------------------------------
+
+select *,age(xmin) age_xmin,age(catalog_xmin) age_catalog_xmin 
+from pg_replication_slots where active = false order by age(xmin) desc;
+
+active replication slots order by age_xmin
+----------------------------------------------
+
+select *,age(xmin) age_xmin,age(catalog_xmin) age_catalog_xmin 
+from pg_replication_slots 
+where active = true 
+order by age(xmin) desc;
+
+Autovacuum , vacuum and maintenance_work_mem Parameters:
+-------------------------------------------------------------
+SELECT name,setting,source,sourcefile from pg_settings where name like '%vacuum%' order by 1;
+SELECT name,setting,source,sourcefile from pg_settings where name ='maintenance_work_mem';
+
+Which tables are currently eligible for autovacuum ?
+-----------------------------------------------------
+
+WITH vbt AS (SELECT setting AS autovacuum_vacuum_threshold FROM pg_settings WHERE name = 'autovacuum_vacuum_threshold')
+    , vsf AS (SELECT setting AS autovacuum_vacuum_scale_factor FROM pg_settings WHERE name = 'autovacuum_vacuum_scale_factor')
+    , fma AS (SELECT setting AS autovacuum_freeze_max_age FROM pg_settings WHERE name = 'autovacuum_freeze_max_age')
+    , sto AS (select opt_oid, split_part(setting, '=', 1) as param, split_part(setting, '=', 2) as value from (select oid opt_oid, unnest(reloptions) setting from pg_class) opt)
+SELECT
+    '"'||ns.nspname||'"."'||c.relname||'"' as relation
+    , pg_size_pretty(pg_table_size(c.oid)) as table_size
+    , age(relfrozenxid) as xid_age
+    , coalesce(cfma.value::float, autovacuum_freeze_max_age::float) autovacuum_freeze_max_age
+    , (coalesce(cvbt.value::float, autovacuum_vacuum_threshold::float) + coalesce(cvsf.value::float,autovacuum_vacuum_scale_factor::float) * c.reltuples) as autovacuum_vacuum_tuples
+    , n_dead_tup as dead_tuples
+FROM pg_class c join pg_namespace ns on ns.oid = c.relnamespace
+join pg_stat_all_tables stat on stat.relid = c.oid
+join vbt on (1=1) join vsf on (1=1) join fma on (1=1)
+left join sto cvbt on cvbt.param = 'autovacuum_vacuum_threshold' and c.oid = cvbt.opt_oid
+left join sto cvsf on cvsf.param = 'autovacuum_vacuum_scale_factor' and c.oid = cvsf.opt_oid
+left join sto cfma on cfma.param = 'autovacuum_freeze_max_age' and c.oid = cfma.opt_oid
+WHERE c.relkind = 'r' and nspname <> 'pg_catalog'
+and (
+    age(relfrozenxid) >= coalesce(cfma.value::float, autovacuum_freeze_max_age::float)
+    or
+    coalesce(cvbt.value::float, autovacuum_vacuum_threshold::float) + coalesce(cvsf.value::float,autovacuum_vacuum_scale_factor::float) * c.reltuples <= n_dead_tup
+   -- or 1 = 1
+)
+ORDER BY age(relfrozenxid) DESC ;
+
+Top-20 tables order by xid age
+----------------------------------
+
+-- this need to be run in each DB in the instance 
+
+SELECT c.oid::regclass as relation_name,     
+        greatest(age(c.relfrozenxid),age(t.relfrozenxid)) as age,
+        pg_size_pretty(pg_table_size(c.oid)) as table_size,
+        c.relkind
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind in ('r', 't','m')
+order by 2 desc limit 20;
+
+indexs inforamtion for Top-20 tables order by xid age
+----------------------------------------------------------
+
+SELECT schemaname,relname AS tablename,
+indexrelname AS indexname,
+idx_scan ,
+pg_relation_size(indexrelid) as index_size,
+pg_size_pretty(pg_relation_size(indexrelid)) AS pretty_index_size
+FROM pg_catalog.pg_stat_all_indexes
+WHERE  relname in (select relation_name::text from (SELECT c.oid::regclass as relation_name,     
+        greatest(age(c.relfrozenxid),age(t.relfrozenxid)) as age,
+        pg_size_pretty(pg_table_size(c.oid)) as table_size,
+        c.relkind
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind in ('r', 't','m')
+order by 2 desc limit 20) as r1 )
+order by 2,4 ;
+
+
+Table Size order by schema name and table size:
+
+SELECT *, pg_size_pretty(total_bytes) AS TOTAL_PRETTY
+    , pg_size_pretty(index_bytes) AS INDEX_PRETTY
+    , pg_size_pretty(toast_bytes) AS TOAST_PRETTY
+    , pg_size_pretty(table_bytes) AS TABLE_PRETTY
+  FROM (
+  SELECT *, total_bytes-index_bytes-COALESCE(toast_bytes,0) AS TABLE_BYTES FROM (
+      SELECT c.oid,nspname AS table_schema, relname AS TABLE_NAME
+              , c.reltuples::bigint AS ROW_ESTIMATE
+              , pg_total_relation_size(c.oid) AS TOTAL_BYTES
+              , pg_indexes_size(c.oid) AS INDEX_BYTES
+              , pg_total_relation_size(reltoastrelid) AS TOAST_BYTES
+          FROM pg_class c
+          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE relkind = 'r'
+  ) a
+) a
+order by 2,8 desc;
+
+biggest 50 tables in the DB:
+
+SELECT *, pg_size_pretty(total_bytes) AS TOTAL_PRETTY
+    , pg_size_pretty(index_bytes) AS INDEX_PRETTY
+    , pg_size_pretty(toast_bytes) AS TOAST_PRETTY
+    , pg_size_pretty(table_bytes) AS TABLE_PRETTY
+  FROM (
+  SELECT *, total_bytes-index_bytes-COALESCE(toast_bytes,0) AS TABLE_BYTES FROM (
+      SELECT c.oid,nspname AS table_schema, relname AS TABLE_NAME
+              , c.reltuples::bigint AS ROW_ESTIMATE
+              , pg_total_relation_size(c.oid) AS TOTAL_BYTES
+              , pg_indexes_size(c.oid) AS INDEX_BYTES
+              , pg_total_relation_size(reltoastrelid) AS TOAST_BYTES
+          FROM pg_class c
+          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE relkind = 'r'
+  ) a
+) a
+order by 5 desc
+LIMIT 50;
+
+
+Index Size order by schema name and table name 
+
+SELECT
+schemaname,relname as "Table",
+indexrelname AS indexname,
+pg_relation_size(indexrelid),
+pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_catalog.pg_statio_all_indexes  ORDER BY 1,2 desc ;
+
+biggest 50 Index in the DB 
+
+SELECT
+schemaname,relname as "Table",
+indexrelname AS indexname,
+pg_relation_size(indexrelid),
+pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_catalog.pg_statio_all_indexes  ORDER BY 4 desc limit 50;
+
+Number of dead rows for the top 50 table 
+
+select relname,n_live_tup, n_tup_upd, n_tup_del, n_dead_tup, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze  from pg_stat_all_tables order by n_dead_tup desc limit 50;
+
+Unused indexes:
+
+SELECT ai.schemaname,ai.relname AS tablename,ai.indexrelid  as index_oid ,
+ai.indexrelname AS indexname,i.indisunique ,
+ai.idx_scan ,
+pg_relation_size(ai.indexrelid) as index_size,
+pg_size_pretty(pg_relation_size(ai.indexrelid)) AS pretty_index_size
+FROM pg_catalog.pg_stat_all_indexes ai , pg_index i
+WHERE ai.indexrelid=i.indexrelid
+and ai.idx_scan = 0 
+and ai.schemaname not in ('pg_catalog')
+order by index_size desc;
+
+
+
 I love :pizza:
 
 -- pgbadger pre-requisites
